@@ -303,54 +303,53 @@ def _infer_type(entry: dict[str, Any]) -> str:
 def parse_citations(payload: str | None) -> CitationExtraction:
     """Parse the JSON payload of a citation block. Never raises."""
     extraction = CitationExtraction()
-    if not payload or not payload.strip():
-        return extraction
 
-    try:
-        data = json.loads(payload)
-    except (TypeError, ValueError) as exc:
-        logger.info("Citation block was not valid JSON; returning no citations: %s", exc)
-        return extraction
-
-    if isinstance(data, dict):
-        items = data.get("citations")
-    elif isinstance(data, list):
-        items = data
-    else:
-        items = None
-    if not isinstance(items, list):
-        return extraction
-
-    seen = set()
-    for entry in items[:MAX_CITATIONS]:
-        extraction.attempted += 1
-        if not isinstance(entry, dict):
-            extraction.rejected.append("citation entry was not an object")
-            continue
-
-        kind = _clean_str(entry.get("type"))
-        kind = kind.lower() if kind else _infer_type(entry)
-        builder = _BUILDERS.get(kind)
-        if builder is None:
-            extraction.rejected.append(f"unknown citation type {kind!r}")
-            continue
-
+    items = None
+    if payload and payload.strip():
         try:
-            citation, reason = builder(entry)
-        except Exception as exc:  # noqa: BLE001 - a bad citation is never fatal
-            citation, reason = None, f"citation rejected: {exc}"
+            data = json.loads(payload)
+        except (TypeError, ValueError) as exc:
+            logger.info("Citation block was not valid JSON; returning no citations: %s", exc)
+            data = None
 
-        if citation is None:
-            extraction.rejected.append(reason or "citation rejected")
-            continue
+        if isinstance(data, dict):
+            items = data.get("citations")
+        elif isinstance(data, list):
+            items = data
 
-        fingerprint = json.dumps(citation.model_dump(), sort_keys=True)
-        if fingerprint in seen:
-            continue
-        seen.add(fingerprint)
-        extraction.citations.append(citation)
+        if isinstance(items, list):
+            seen = set()
+            for entry in items[:MAX_CITATIONS]:
+                extraction.attempted += 1
+                if not isinstance(entry, dict):
+                    extraction.rejected.append("citation entry was not an object")
+                    continue
 
-    # Run advanced verification (format, completeness, cross-reference, drift).
+                kind = _clean_str(entry.get("type"))
+                kind = kind.lower() if kind else _infer_type(entry)
+                builder = _BUILDERS.get(kind)
+                if builder is None:
+                    extraction.rejected.append(f"unknown citation type {kind!r}")
+                    continue
+
+                try:
+                    citation, reason = builder(entry)
+                except Exception as exc:  # noqa: BLE001 - a bad citation is never fatal
+                    citation, reason = None, f"citation rejected: {exc}"
+
+                if citation is None:
+                    extraction.rejected.append(reason or "citation rejected")
+                    continue
+
+                fingerprint = json.dumps(citation.model_dump(), sort_keys=True)
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                extraction.citations.append(citation)
+
+    # Run advanced verification (format, completeness, cross-reference, drift)
+    # on whatever survived parsing — including the empty extraction, so
+    # callers always see defaults rather than a missing key.
     # Imported lazily to avoid a circular import: citation_verification imports
     # the Citation models from this module at module load time.
     try:
@@ -433,10 +432,7 @@ def verify_evidence(text: str | None) -> EvidenceVerificationReport:
                 )
             )
             continue
-        weak = any(
-            isinstance(c, HadithCitation) and c.grading and "sahih" not in c.grading
-            for c in matched
-        )
+        weak = any(isinstance(c, HadithCitation) and c.grading and "sahih" not in c.grading for c in matched)
         report.claims.append(
             ClaimVerification(
                 claim=claim,
@@ -447,9 +443,7 @@ def verify_evidence(text: str | None) -> EvidenceVerificationReport:
             )
         )
     if report.claims:
-        report.overall_score = round(
-            sum(1 for c in report.claims if c.supported) / len(report.claims), 4
-        )
+        report.overall_score = round(sum(1 for c in report.claims if c.supported) / len(report.claims), 4)
     return report
 
 
@@ -612,12 +606,10 @@ class AnswerQualityJudge:
             threshold=self.threshold,
         )
 
-    def _accuracy(
-        self, answer: str, citations: CitationExtraction | None
-    ) -> QualityScore:
+    def _accuracy(self, answer: str, citations: CitationExtraction | None) -> QualityScore:
         if citations is not None and citations.score is not None:
             score = citations.score
-            feedback = "Verified citation ratio is {:.0%}.".format(score)
+            feedback = f"Verified citation ratio is {score:.0%}."
         else:
             score = 0.75
             feedback = "No verifiable citations; accuracy is assumed pending review."
@@ -639,9 +631,7 @@ class AnswerQualityJudge:
     def _clarity(self, answer: str) -> QualityScore:
         sentences = [s for s in re.split(r"[.!?]+", answer) if s.strip()]
         if not sentences:
-            return QualityScore(
-                dimension="clarity", score=0.0, feedback="No readable content."
-            )
+            return QualityScore(dimension="clarity", score=0.0, feedback="No readable content.")
         words = answer.split()
         avg_sentence = len(words) / len(sentences)
         avg_word = sum(len(word) for word in words) / len(words)
@@ -654,12 +644,10 @@ class AnswerQualityJudge:
         return QualityScore(
             dimension="clarity",
             score=score,
-            feedback="Average sentence length is {:.1f} words.".format(avg_sentence),
+            feedback=f"Average sentence length is {avg_sentence:.1f} words.",
         )
 
-    def _scholarly_rigor(
-        self, answer: str, citations: CitationExtraction | None
-    ) -> QualityScore:
+    def _scholarly_rigor(self, answer: str, citations: CitationExtraction | None) -> QualityScore:
         lower = answer.lower()
         markers = sum(1 for marker in _SCHOLARLY_MARKERS if marker in lower)
         score = 0.4
@@ -669,7 +657,7 @@ class AnswerQualityJudge:
         return QualityScore(
             dimension="scholarly_rigor",
             score=score,
-            feedback="Scholarly markers found: {}.".format(markers),
+            feedback=f"Scholarly markers found: {markers}.",
         )
 
     def _appropriateness(self, answer: str) -> QualityScore:
@@ -683,9 +671,7 @@ class AnswerQualityJudge:
         else:
             score = 0.6
             feedback = "Answer may be overlong; consider tightening."
-        return QualityScore(
-            dimension="appropriateness", score=score, feedback=feedback
-        )
+        return QualityScore(dimension="appropriateness", score=score, feedback=feedback)
 
     def _balance(self, answer: str) -> QualityScore:
         lower = answer.lower()
@@ -708,12 +694,10 @@ class AnswerQualityJudge:
         return QualityScore(
             dimension="objectivity",
             score=score,
-            feedback="Subjective markers found: {}.".format(markers),
+            feedback=f"Subjective markers found: {markers}.",
         )
 
-    def _citation_quality(
-        self, citations: CitationExtraction | None
-    ) -> QualityScore:
+    def _citation_quality(self, citations: CitationExtraction | None) -> QualityScore:
         if citations is None or not citations.citations:
             return QualityScore(
                 dimension="citation_quality",
@@ -721,10 +705,8 @@ class AnswerQualityJudge:
                 feedback="No citations provided; scholarly verification is limited.",
             )
         score = citations.score if citations.score is not None else 0.5
-        feedback = "{} verified citation(s).".format(len(citations.citations))
-        return QualityScore(
-            dimension="citation_quality", score=score, feedback=feedback
-        )
+        feedback = f"{len(citations.citations)} verified citation(s)."
+        return QualityScore(dimension="citation_quality", score=score, feedback=feedback)
 
     def _find_gaps(self, answer: str) -> list[str]:
         gaps: list[str] = []
@@ -739,15 +721,11 @@ class AnswerQualityJudge:
             gaps.append("A concluding synthesis is missing.")
         return gaps
 
-    def _recommendations(
-        self, scores: list[QualityScore], gaps: list[str]
-    ) -> list[str]:
+    def _recommendations(self, scores: list[QualityScore], gaps: list[str]) -> list[str]:
         recommendations = list(gaps)
         for item in scores:
             if item.score < 0.5:
-                recommendations.append(
-                    "Improve {}: {}".format(item.dimension.replace("_", " "), item.feedback)
-                )
+                recommendations.append("Improve {}: {}".format(item.dimension.replace("_", " "), item.feedback))
         return recommendations[:5]
 
 
@@ -773,3 +751,149 @@ Rules for the block:
 4. Write your answer normally first. The block is in addition to your answer,
    never a replacement for it, and never a substitute for citing sources in prose.
 """
+
+
+class SynthesizedCitation(BaseModel):
+    """A citation with the agent IDs that contributed to it."""
+
+    citation: Citation
+    sources: list[str] = Field(default_factory=list)
+
+
+class CitationConsolidation(BaseModel):
+    """Consolidated citation output with attribution and conflict diagnostics."""
+
+    citations: list[SynthesizedCitation] = Field(default_factory=list)
+    attempted: int = 0
+    rejected: list[str] = Field(default_factory=list)
+    conflicts: list[str] = Field(default_factory=list)
+    source_count: int = 0
+
+    @property
+    def score(self) -> float | None:
+        if self.attempted <= 0:
+            return None
+        return round(len(self.citations) / self.attempted, 4)
+
+
+def _citation_ref(citation: Citation) -> str:
+    if isinstance(citation, QuranCitation):
+        return citation.reference
+    if isinstance(citation, HadithCitation):
+        return f"{citation.collection} {citation.number}" if citation.number else citation.collection
+    return citation.work
+
+
+class CitationSynthesisEngine:
+    """Merge citation extractions from multiple agent responses.
+
+    The engine is attribution-preserving: every synthesized citation records
+    which agents supplied it. Exact duplicates are folded together, overlapping
+    Quran ranges are merged, and contradictory hadith gradings or scholarly
+    authorship are recorded as conflicts instead of being silently dropped.
+    """
+
+    def __init__(self, max_citations: int = MAX_CITATIONS) -> None:
+        self._max_citations = max_citations
+        self._citations: list[SynthesizedCitation] = []
+        self._attempted = 0
+        self._rejected: list[str] = []
+        self._conflicts: list[str] = []
+        self._sources: set[str] = set()
+
+    def add_agent_output(self, source_id: str, text: str | None) -> None:
+        """Parse one agent answer and fold its citations into the synthesis."""
+        _, extraction = extract_citations(text)
+        self.add_extraction(source_id, extraction)
+
+    def add_extraction(self, source_id: str, extraction: CitationExtraction) -> None:
+        """Merge an existing extraction, attributing it to *source_id*."""
+        if source_id:
+            self._sources.add(source_id)
+        self._attempted += extraction.attempted
+        self._rejected.extend(extraction.rejected)
+        for citation in extraction.citations:
+            self._add_citation(citation, source_id)
+
+    def synthesize(self) -> CitationConsolidation:
+        """Return the final consolidated citation set and its diagnostics."""
+        return CitationConsolidation(
+            citations=list(self._citations),
+            attempted=self._attempted,
+            rejected=self._rejected,
+            conflicts=self._conflicts,
+            source_count=len(self._sources),
+        )
+
+    def _add_citation(self, citation: Citation, source_id: str) -> None:
+        if len(self._citations) >= self._max_citations:
+            self._rejected.append(f"citation limit {self._max_citations} reached; dropping {_citation_ref(citation)}")
+            return
+        existing = self._find_related(citation)
+        if existing is None:
+            existing = SynthesizedCitation(citation=citation, sources=[])
+            self._citations.append(existing)
+        else:
+            self._merge_citation(existing, citation)
+        if source_id and source_id not in existing.sources:
+            existing.sources.append(source_id)
+
+    def _find_related(self, citation: Citation) -> SynthesizedCitation | None:
+        if isinstance(citation, QuranCitation):
+            for item in self._citations:
+                current = item.citation
+                if isinstance(current, QuranCitation) and current.surah == citation.surah:
+                    if self._ranges_overlap(current, citation):
+                        return item
+            return None
+        key = self._exact_key(citation)
+        for item in self._citations:
+            if self._exact_key(item.citation) == key:
+                return item
+        return None
+
+    def _merge_citation(self, target: SynthesizedCitation, incoming: Citation) -> None:
+        current = target.citation
+        if isinstance(incoming, QuranCitation) and isinstance(current, QuranCitation):
+            start = min(current.ayah_start, incoming.ayah_start)
+            end = max(current.ayah_end or current.ayah_start, incoming.ayah_end or incoming.ayah_start)
+            target.citation = QuranCitation(
+                surah=current.surah,
+                ayah_start=start,
+                ayah_end=end if end != start else None,
+                surah_name=current.surah_name,
+            )
+            return
+        if isinstance(incoming, HadithCitation) and isinstance(current, HadithCitation):
+            if current.number == incoming.number:
+                if incoming.grading and not current.grading:
+                    current.grading = incoming.grading
+                elif current.grading and incoming.grading and current.grading != incoming.grading:
+                    self._conflicts.append(
+                        f"conflicting gradings for {current.collection} {current.number}: "
+                        f"{current.grading!r} vs {incoming.grading!r}"
+                    )
+            return
+        if isinstance(incoming, ScholarlyReference) and isinstance(current, ScholarlyReference):
+            if current.work.casefold() == incoming.work.casefold():
+                if incoming.author and not current.author:
+                    current.author = incoming.author
+                elif current.author and incoming.author and current.author != incoming.author:
+                    self._conflicts.append(
+                        f"conflicting authors for {current.work!r}: {current.author!r} vs {incoming.author!r}"
+                    )
+            return
+
+    @staticmethod
+    def _exact_key(citation: Citation) -> tuple[Any, ...]:
+        if isinstance(citation, HadithCitation):
+            return ("hadith", citation.collection, citation.number)
+        if isinstance(citation, ScholarlyReference):
+            return ("scholarly", citation.work.casefold())
+        return ("",)
+
+    @staticmethod
+    def _ranges_overlap(a: QuranCitation, b: QuranCitation) -> bool:
+        a_end = a.ayah_end or a.ayah_start
+        b_end = b.ayah_end or b.ayah_start
+        return a.ayah_start <= b_end + 1 and b.ayah_start <= a_end + 1

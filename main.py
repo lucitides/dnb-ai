@@ -8,7 +8,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
@@ -81,6 +81,7 @@ from hadith import (
     build_caution_note,
 )
 from hadith_context import router as hadith_context_router
+from hadith_research import router as hadith_research_router
 from history import router as history_router
 from intent import accuracy_tracker as intent_accuracy_tracker, classify_intent
 from memory import ChatSummary, UserProfile, create_memory_store, render_user_context
@@ -120,6 +121,7 @@ from stellar import (
     ZakatContext,
     ZakatInfo,
     build_chat_purchase_context,
+    build_chat_stellar_calculation_context,
     build_chat_zakat_context,
     redact_secret_keys,
     router as stellar_router,
@@ -139,11 +141,67 @@ from tafsir import (
     summarize_tafsir_context,
     tafsir_system_context,
 )
+from video_analysis import router as video_analysis_router
 from vocabulary import router as vocabulary_router
 
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
+# --- Confidence calibration -------------------------------------------------
+CONFIDENCE_TEMPERATURE = 1.15
+CONFIDENCE_CALIBRATION_MAX_EVENTS = 10000
+_calibration_events: list[dict[str, Any]] = []
+
+
+def _calibrate_assessment(
+    assessment: ConfidenceAssessment,
+    *,
+    citation_verification: float | None,
+    evidence_quality: float,
+) -> ConfidenceAssessment:
+    """Temperature-scale the raw confidence and adjust for evidence strength."""
+    if assessment is None:
+        return assessment
+    score = assessment.score
+    calibrated = score**CONFIDENCE_TEMPERATURE if score >= 0.5 else 1 - (1 - score) ** CONFIDENCE_TEMPERATURE
+    calibrated += (float(citation_verification or 0.0) - 0.5) * 0.15
+    calibrated += (float(evidence_quality or 0.0) - 0.5) * 0.05
+    assessment.score = round(min(0.99, max(0.01, calibrated)), 4)
+    try:
+        thresholds = confidence_thresholds()
+        best = None
+        for band in ConfidenceBand:
+            try:
+                raw_limit = thresholds.get(band.value)
+                if raw_limit is None:
+                    continue
+                limit = float(raw_limit)
+            except (TypeError, ValueError):
+                continue
+            if assessment.score >= limit and (best is None or limit > best[0]):
+                best = (limit, band)
+        if best is not None:
+            assessment.band = best[1]
+    except Exception:
+        pass
+    return assessment
+
+
+def _track_calibration(assessment: ConfidenceAssessment) -> None:
+    """Record one calibration observation for /confidence/policy."""
+    if assessment is None:
+        return
+    _calibration_events.append(
+        {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "score": assessment.score,
+            "band": assessment.band.value,
+            "queued": assessment.queued,
+        }
+    )
+    if len(_calibration_events) > CONFIDENCE_CALIBRATION_MAX_EVENTS:
+        del _calibration_events[: len(_calibration_events) - CONFIDENCE_CALIBRATION_MAX_EVENTS]
+
 
 GEMINI_API_KEY = settings.gemini_api_key
 
@@ -265,8 +323,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
-# Stellar integration: read-only zakat/balance features on the network
-# the rest of the Deen Bridge platform settles on
+# Stellar integration: read-only wallet and payment lookups plus deterministic
+# USDC arithmetic on the network the rest of Deen Bridge settles on.
 app.include_router(stellar_router)
 app.include_router(reasoning_router)
 app.include_router(study_router)
@@ -286,6 +344,9 @@ app.include_router(reformulation_router)
 app.include_router(hadith_context_router)
 # Audio Hadith: verify transcribed narrations against an authenticated corpus
 app.include_router(audio_hadith_router)
+# Hadith Research: retrieval, isnad analysis, rijal cross-referencing, grading
+# justification, and variant alignment across ten major collections
+app.include_router(hadith_research_router)
 # Database query optimization: static anti-pattern analysis + runtime profiling
 app.include_router(query_optimizer_router)
 # Historical context: asbab al-nuzul, hadith circumstances, and fiqh development
@@ -298,6 +359,7 @@ app.include_router(arabic_ocr_router)
 app.include_router(vocabulary_router)
 # Swahili language processing: Islamic terminology, loanword morphology, and East African context
 app.include_router(swahili_router)
+app.include_router(video_analysis_router)
 # Arabic dialect support: Egyptian/Gulf/Levantine identification, MSA
 # normalization and dialectal terminology lexicon (#136)
 app.include_router(arabic_dialect_router)
@@ -829,11 +891,7 @@ def verify_evidence_claims(
 ) -> EvidenceVerificationResult:
     """Deterministic claim-evidence audit using already-verified citations."""
     result = EvidenceVerificationResult()
-    claims = [
-        s.strip()
-        for s in response_text.replace("\n", " ").split(".")
-        if len(s.strip()) >= 25
-    ]
+    claims = [s.strip() for s in response_text.replace("\n", " ").split(".") if len(s.strip()) >= 25]
     evidence: list[tuple[str, str, bool]] = []
 
     for c in citation_extraction.citations:
@@ -971,6 +1029,7 @@ async def chat(body: ChatRequest, request: Request, fastapi_response: Response) 
             # inline summary or a best-effort JWT fetch — never other users'.
             purchase_context = await purchase_retriever(body.prompt, body.transactions, body.auth_token)
             purchase_info = purchase_context.info if purchase_context else None
+            stellar_calculation_context = build_chat_stellar_calculation_context(prompt)
 
         # --- Memory lookup ---
         profile: UserProfile | None = None
@@ -992,6 +1051,7 @@ async def chat(body: ChatRequest, request: Request, fastapi_response: Response) 
             and tafsir_context is None
             and zakat_context is None
             and purchase_context is None
+            and stellar_calculation_context is None
             and SEMANTIC_CACHE_ENABLED
         )
 
@@ -1105,6 +1165,8 @@ async def chat(body: ChatRequest, request: Request, fastapi_response: Response) 
                 system_context += zakat_context.prompt_block
             if purchase_context is not None:
                 system_context += purchase_context.prompt_block
+            if stellar_calculation_context is not None:
+                system_context += "\n\n" + stellar_calculation_context
             if is_swahili and swahili_analysis:
                 sw_enhancement = swahili_response_enhancer.build_prompt_enhancement(safety_prompt)
                 if sw_enhancement.cultural_notes:
@@ -1220,6 +1282,16 @@ async def chat(body: ChatRequest, request: Request, fastapi_response: Response) 
             citation_verification=citation_extraction.score,
         )
         assessment = assess(signals)
+        assessment = _calibrate_assessment(
+            assessment,
+            citation_verification=citation_extraction.score,
+            evidence_quality=1.0 if hadith_refs else (0.6 if citation_extraction.citations else 0.4),
+        )
+        _track_calibration(assessment)
+        if assessment.band is ConfidenceBand.CONFIDENT:
+            assessment.queued = False
+        elif not assessment.queued:
+            assessment.queued = True
         answer_before_policy = response_text
 
         if assessment.queued:
@@ -1505,6 +1577,7 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
             tafsir_info = summarize_tafsir_context(tafsir_context) if tafsir_context else None
             zakat_context = await zakat_retriever(body.prompt, body.context)
             zakat_info = zakat_context.info if zakat_context else None
+            stellar_calculation_context = build_chat_stellar_calculation_context(prompt)
 
         combined_text: str = ""  # accumulated full response for post-processing
         chat_session = None
@@ -1582,6 +1655,8 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
                     system_context += zakat_context.prompt_block
                 if purchase_context is not None:
                     system_context += purchase_context.prompt_block
+                if stellar_calculation_context is not None:
+                    system_context += "\n\n" + stellar_calculation_context
 
                 ctx = f"Additional context: {extra_context}\n\n" if extra_context else ""
                 full_prompt = f"{system_context}\n{ctx}User question: {generation_prompt}"
@@ -1670,6 +1745,16 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
                     citation_verification=citation_extraction.score,
                 )
                 assessment = assess(signals)
+                assessment = _calibrate_assessment(
+                    assessment,
+                    citation_verification=citation_extraction.score,
+                    evidence_quality=1.0 if hadith_refs else (0.6 if citation_extraction.citations else 0.4),
+                )
+                _track_calibration(assessment)
+                if assessment.band is ConfidenceBand.CONFIDENT:
+                    assessment.queued = False
+                elif not assessment.queued:
+                    assessment.queued = True
 
                 if assessment.queued:
                     try:
@@ -2188,9 +2273,23 @@ async def metrics() -> dict[str, Any]:
 @app.get("/confidence/policy")
 async def confidence_policy() -> dict[str, Any]:
     """Current confidence thresholds and the queue's durability."""
+    calibration = None
+    if _calibration_events:
+        scores = [event["score"] for event in _calibration_events]
+        calibration = {
+            "observations": len(_calibration_events),
+            "mean_score": round(sum(scores) / len(scores), 4),
+            "min_score": round(min(scores), 4),
+            "max_score": round(max(scores), 4),
+            "bands": {
+                band: sum(1 for event in _calibration_events if event["band"] == band)
+                for band in (b.value for b in ConfidenceBand)
+            },
+        }
     return {
         "thresholds": confidence_thresholds(),
         "review_queue": await review_store.stats(),
+        "calibration": calibration,
     }
 
 
